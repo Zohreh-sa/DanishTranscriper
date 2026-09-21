@@ -1,0 +1,29 @@
+name: Build Windows App
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [ main ]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Regression tests
+        run: dotnet run --project DanishTranscriber.Tests/DanishTranscriber.Tests.csproj -c Release
+      - name: Dependency vulnerability report
+        run: dotnet list DanishTranscriber/DanishTranscriber.csproj package --vulnerable --include-transitive
+      - name: Publish
+        run: dotnet publish DanishTranscriber/DanishTranscriber.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path DanishTranscriber/bin/Release/net8.0-windows/win-x64/publish/* -DestinationPath DanishTranscriber-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DanishTranscriber-Windows-x64
+          path: DanishTranscriber-Windows-x64.zip
