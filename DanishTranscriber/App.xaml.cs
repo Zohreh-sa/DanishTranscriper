@@ -1,1 +1,0 @@
-using System.Windows; namespace DanishTranscriber; public partial class App : Application { }
