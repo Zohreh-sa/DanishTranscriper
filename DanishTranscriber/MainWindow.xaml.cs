@@ -1,7 +1,10 @@
-using System.ComponentModel;
 using System.IO;
 using System.Net.Http;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Wordprocessing;
 using NAudio.Wave;
 using Whisper.net;
 
@@ -9,237 +12,313 @@ namespace DanishTranscriber;
 
 public partial class MainWindow : Window
 {
-    private readonly PcmBuffer audio = new();
-    private readonly string appDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DanishTranscriber");
-    private WaveInEvent? mic;
-    private CancellationTokenSource? startupCancellation;
-    private CancellationTokenSource? stopDelay;
-    private Task? startupTask;
-    private Task? worker;
-    private Task? stoppingTask;
-    private TaskCompletionSource<bool>? recordingStopped;
-    private string? docxPath;
-    private DateTime started;
-    private string? sessionError;
-    private bool closing;
-    private bool allowClose;
-    private bool recordingStarted;
-    private volatile bool acceptAudio;
-    private string ModelPath => Path.Combine(appDir, "ggml-small.bin");
+    const int SampleRate = 16000;
+    const int ProcessingIntervalMs = 3000;
+    const int MinimumAudioBytes = SampleRate * 2; // One second of 16-bit mono audio.
+
+    WaveInEvent? mic;
+    MemoryStream? audio;
+    CancellationTokenSource? cts;
+    string? docxPath;
+    string? lastAcceptedText;
+    readonly SemaphoreSlim saveLock = new(1, 1);
+    readonly string appDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DanishTranscriber");
+
+    string ModelPath => Path.Combine(appDir, "ggml-small.bin");
 
     public MainWindow() => InitializeComponent();
 
-    private async void Start_Click(object sender, RoutedEventArgs e)
+    async void Start_Click(object sender, RoutedEventArgs e)
     {
-        if (startupTask is { IsCompleted: false } || mic != null || closing) return;
-        startupTask = StartAsync();
-        await startupTask;
-    }
-
-    private async Task StartAsync()
-    {
-        StartButton.IsEnabled = false;
-        StopButton.IsEnabled = false;
-        stoppingTask = null;
-        worker = null;
-        sessionError = null;
-        docxPath = null;
-        audio.Clear();
-        startupCancellation = new CancellationTokenSource();
         try
         {
-            StatusText.Text = "Checking model / downloading on first run (~466 MiB)…";
-            using var client = new HttpClient { Timeout = TimeSpan.FromHours(1) };
-            await new ModelCache(client, ModelCache.SmallModelUrl, ModelCache.SmallModelSha256)
-                .EnsureAsync(ModelPath, startupCancellation.Token);
-            startupCancellation.Token.ThrowIfCancellationRequested();
-
-            var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Danish Transcripts");
-            Directory.CreateDirectory(directory);
-            docxPath = TranscriptDocument.NewPath(directory);
-            started = DateTime.Now;
-            TranscriptDocument.Save(docxPath, "", started);
+            StartButton.IsEnabled = false;
             TranscriptBox.Clear();
-            stopDelay = new CancellationTokenSource();
-            recordingStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            mic = new WaveInEvent { WaveFormat = new WaveFormat(16000, 16, 1), BufferMilliseconds = 100 };
-            mic.DataAvailable += OnDataAvailable;
-            mic.RecordingStopped += OnRecordingStopped;
-            acceptAudio = true;
+            lastAcceptedText = null;
+
+            Directory.CreateDirectory(appDir);
+            await EnsureModelAsync();
+
+            var transcriptDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "Danish Transcripts");
+            Directory.CreateDirectory(transcriptDirectory);
+            docxPath = Path.Combine(transcriptDirectory, $"{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.docx");
+            await SaveDocxAsync();
+
+            audio = new MemoryStream();
+            mic = new WaveInEvent
+            {
+                WaveFormat = new WaveFormat(SampleRate, 16, 1),
+                BufferMilliseconds = 100
+            };
+            mic.DataAvailable += Mic_DataAvailable;
             mic.StartRecording();
-            recordingStarted = true;
-            var stop = stopDelay.Token;
-            worker = Task.Run(() => TranscribeAsync(stop));
+
+            cts = new CancellationTokenSource();
             StopButton.IsEnabled = true;
             StatusText.Text = "Listening • local/offline transcription";
-        }
-        catch (OperationCanceledException) when (startupCancellation.IsCancellationRequested)
-        {
-            StatusText.Text = "Start cancelled";
+            _ = RunTranscriptionLoopAsync(cts.Token);
         }
         catch (Exception ex)
         {
-            sessionError = ex.Message;
-            await StopSessionAsync();
-        }
-        finally
-        {
-            startupCancellation.Dispose();
-            startupCancellation = null;
-            if (mic is null && !closing) StartButton.IsEnabled = true;
+            StartButton.IsEnabled = true;
+            StatusText.Text = "Error";
+            MessageBox.Show(ex.ToString(), "Could not start");
         }
     }
 
-    private void OnDataAvailable(object? sender, WaveInEventArgs e)
+    void Mic_DataAvailable(object? sender, WaveInEventArgs e)
     {
-        if (!acceptAudio) return;
-        if (!audio.TryAppend(e.Buffer, e.BytesRecorded))
-        {
-            acceptAudio = false;
-            Dispatcher.BeginInvoke(new Action(async () =>
-            {
-                if (!ReferenceEquals(sender, mic)) return;
-                sessionError ??= "Transcription could not keep up. Recording stopped because the audio buffer is full; some audio was not captured.";
-                await StopSessionAsync();
-            }));
-        }
+        var currentAudio = audio;
+        if (currentAudio is null)
+            return;
+
+        lock (currentAudio)
+            currentAudio.Write(e.Buffer, 0, e.BytesRecorded);
     }
 
-    private void OnRecordingStopped(object? sender, StoppedEventArgs e)
+    async Task EnsureModelAsync()
     {
-        Dispatcher.BeginInvoke(new Action(async () =>
-        {
-            if (!ReferenceEquals(sender, mic)) return;
-            acceptAudio = false;
-            if (e.Exception != null) sessionError ??= e.Exception.Message;
-            recordingStopped?.TrySetResult(true);
-            if (stoppingTask is null) await StopSessionAsync();
-        }));
+        if (File.Exists(ModelPath))
+            return;
+
+        StatusText.Text = "First run: downloading Whisper small model (~466 MB)…";
+        using var httpClient = new HttpClient { Timeout = TimeSpan.FromHours(1) };
+        using var response = await httpClient.GetAsync(
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+            HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+
+        await using var modelStream = await response.Content.ReadAsStreamAsync();
+        await using var modelFile = File.Create(ModelPath);
+        await modelStream.CopyToAsync(modelFile);
     }
 
-    private async Task TranscribeAsync(CancellationToken stop)
+    async Task RunTranscriptionLoopAsync(CancellationToken cancellationToken)
     {
         try
         {
             using var factory = WhisperFactory.FromPath(ModelPath);
             using var processor = factory.CreateBuilder().WithLanguage("da").Build();
-            await AudioPump.RunAsync(audio, stop, async samples =>
+
+            while (!cancellationToken.IsCancellationRequested)
             {
+                await Task.Delay(ProcessingIntervalMs, cancellationToken);
+                var pcm = TakePendingAudio();
+
+                // Do not ask Whisper to transcribe quiet chunks. Whisper can otherwise
+                // hallucinate or repeat the last sentence when it receives silence.
+                if (pcm.Length < MinimumAudioBytes || !ContainsSpeech(pcm))
+                {
+                    StatusText.Text = "Listening";
+                    continue;
+                }
+
+                StatusText.Text = "Transcribing locally…";
+                var wav = BuildWav(pcm);
+                await using var wavStream = new MemoryStream(wav);
                 var parts = new List<string>();
-                await foreach (var segment in processor.ProcessAsync(samples))
-                    if (!string.IsNullOrWhiteSpace(segment.Text)) parts.Add(segment.Text.Trim());
-                if (parts.Count > 0)
-                    await Dispatcher.InvokeAsync(() =>
-                    {
-                        TranscriptBox.AppendText((TranscriptBox.Text.Length > 0 ? " " : "") + string.Join(" ", parts));
-                        TranscriptBox.ScrollToEnd();
-                        SaveTranscript();
-                    });
-            });
+
+                await foreach (var segment in processor.ProcessAsync(wavStream, cancellationToken))
+                {
+                    var text = segment.Text.Trim();
+                    if (!string.IsNullOrWhiteSpace(text) && !IsSilenceMarker(text))
+                        parts.Add(text);
+                }
+
+                var transcription = string.Join(" ", parts).Trim();
+                if (!string.IsNullOrWhiteSpace(transcription) && !IsImmediateDuplicate(transcription))
+                {
+                    TranscriptBox.AppendText((TranscriptBox.Text.Length > 0 ? " " : "") + transcription);
+                    TranscriptBox.ScrollToEnd();
+                    lastAcceptedText = NormalizeForComparison(transcription);
+                    await SaveDocxAsync();
+                }
+
+                StatusText.Text = "Listening";
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal when Stop is pressed or the window closes.
         }
         catch (Exception ex)
         {
-            await Dispatcher.InvokeAsync(() =>
-            {
-                sessionError ??= "Transcription failed: " + ex.Message;
-                Dispatcher.BeginInvoke(new Action(async () => await StopSessionAsync()));
-            });
+            StatusText.Text = "Transcription error";
+            MessageBox.Show(ex.ToString(), "Transcription error");
         }
     }
 
-    private async void Stop_Click(object sender, RoutedEventArgs e) => await StopSessionAsync();
-    private Task StopSessionAsync() => stoppingTask ??= StopCoreAsync();
-
-    private async Task StopCoreAsync()
+    byte[] TakePendingAudio()
     {
-        // Store stoppingTask before any callback or error dialog can re-enter Stop.
-        await Task.Yield();
+        var currentAudio = audio;
+        if (currentAudio is null)
+            return Array.Empty<byte>();
+
+        lock (currentAudio)
+        {
+            var pcm = currentAudio.ToArray();
+            currentAudio.SetLength(0);
+            currentAudio.Position = 0;
+            return pcm;
+        }
+    }
+
+    static bool ContainsSpeech(byte[] pcm)
+    {
+        // Analyse 20 ms frames. A chunk counts as speech only when several frames
+        // have both useful average energy and a clear peak, which rejects room noise
+        // and isolated clicks while still allowing normal classroom speech.
+        const int bytesPerSample = 2;
+        const int frameSamples = SampleRate / 50;
+        const double rmsThreshold = 0.008;
+        const double peakThreshold = 0.025;
+        const int requiredSpeechFrames = 4;
+
+        var speechFrames = 0;
+        for (var frameStart = 0; frameStart + frameSamples * bytesPerSample <= pcm.Length; frameStart += frameSamples * bytesPerSample)
+        {
+            double sumSquares = 0;
+            var peak = 0;
+
+            for (var i = 0; i < frameSamples; i++)
+            {
+                var offset = frameStart + i * bytesPerSample;
+                var sample = (short)(pcm[offset] | (pcm[offset + 1] << 8));
+                var absoluteSample = Math.Abs((int)sample);
+                peak = Math.Max(peak, absoluteSample);
+                sumSquares += (double)sample * sample;
+            }
+
+            var rms = Math.Sqrt(sumSquares / frameSamples) / short.MaxValue;
+            var normalizedPeak = peak / (double)short.MaxValue;
+            if (rms >= rmsThreshold && normalizedPeak >= peakThreshold)
+            {
+                speechFrames++;
+                if (speechFrames >= requiredSpeechFrames)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool IsImmediateDuplicate(string text)
+    {
+        var normalized = NormalizeForComparison(text);
+        return normalized.Length > 0 && normalized == lastAcceptedText;
+    }
+
+    static string NormalizeForComparison(string text)
+    {
+        var lower = text.ToLowerInvariant();
+        var withoutPunctuation = Regex.Replace(lower, @"[^\p{L}\p{N}\s]", " ");
+        return Regex.Replace(withoutPunctuation, @"\s+", " ").Trim();
+    }
+
+    static bool IsSilenceMarker(string text)
+    {
+        var normalized = NormalizeForComparison(text);
+        return normalized is "silence" or "blank audio" or "music" or "musik";
+    }
+
+    async void Stop_Click(object sender, RoutedEventArgs e)
+    {
+        cts?.Cancel();
+        if (mic is not null)
+        {
+            mic.DataAvailable -= Mic_DataAvailable;
+            mic.StopRecording();
+            mic.Dispose();
+            mic = null;
+        }
+
+        await SaveDocxAsync();
+        StatusText.Text = $"Saved: {docxPath}";
         StopButton.IsEnabled = false;
-        StartButton.IsEnabled = false;
-        StatusText.Text = "Finishing transcription and saving…";
+        StartButton.IsEnabled = true;
+    }
+
+    async Task SaveDocxAsync()
+    {
+        if (docxPath is null)
+            return;
+
+        await saveLock.WaitAsync();
         try
         {
-            if (mic != null && recordingStarted)
+            var temporaryPath = docxPath + ".tmp";
+            using (var document = WordprocessingDocument.Create(
+                       temporaryPath,
+                       DocumentFormat.OpenXml.WordprocessingDocumentType.Document))
             {
-                try
-                {
-                    mic.StopRecording();
-                    // NAudio delivers the last capture buffers before RecordingStopped.
-                    await recordingStopped!.Task;
-                }
-                catch (Exception ex)
-                {
-                    sessionError ??= "Could not stop microphone: " + ex.Message;
-                    DisposeMicrophone();
-                }
+                var mainPart = document.AddMainDocumentPart();
+                mainPart.Document = new Document(
+                    new Body(
+                        new Paragraph(new Run(new Text($"Danish transcript — {DateTime.Now:yyyy-MM-dd HH:mm}"))),
+                        new Paragraph(
+                            new Run(
+                                new Text(TranscriptBox.Text ?? "")
+                                {
+                                    Space = DocumentFormat.OpenXml.SpaceProcessingModeValues.Preserve
+                                }))));
+                mainPart.Document.Save();
             }
-            stopDelay?.Cancel();
-            if (worker != null) await worker;
-            SaveTranscript();
+
+            File.Move(temporaryPath, docxPath, true);
         }
-        catch (Exception ex) { sessionError ??= "Could not finish saving: " + ex.Message; }
         finally
         {
-            DisposeMicrophone();
-            stopDelay?.Dispose();
-            stopDelay = null;
-            audio.Clear();
-            StartButton.IsEnabled = !closing;
-            StatusText.Text = sessionError is null ? $"Saved: {docxPath}" : "Error: " + sessionError;
-            if (sessionError != null)
-                MessageBox.Show(this, sessionError + "\nThe visible text can still be copied.", "Transcription error", MessageBoxButton.OK, MessageBoxImage.Error);
+            saveLock.Release();
         }
     }
 
-    private void DisposeMicrophone()
-    {
-        acceptAudio = false;
-        var capture = mic;
-        mic = null;
-        recordingStarted = false;
-        if (capture is null) return;
-        capture.DataAvailable -= OnDataAvailable;
-        capture.RecordingStopped -= OnRecordingStopped;
-        try { capture.Dispose(); }
-        catch (Exception ex) { sessionError ??= "Could not release microphone: " + ex.Message; }
-    }
-
-    private void SaveTranscript()
-    {
-        if (docxPath != null) TranscriptDocument.Save(docxPath, TranscriptBox.Text, started);
-    }
-
-    private void Clear_Click(object sender, RoutedEventArgs e)
+    void Clear_Click(object sender, RoutedEventArgs e)
     {
         TranscriptBox.Clear();
-        try { SaveTranscript(); }
-        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Could not save cleared transcript"); }
+        lastAcceptedText = null;
     }
 
-    private void Copy_Click(object sender, RoutedEventArgs e)
+    void Copy_Click(object sender, RoutedEventArgs e)
     {
-        try { if (TranscriptBox.Text.Length > 0) Clipboard.SetText(TranscriptBox.Text); }
-        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Could not copy transcript"); }
+        if (!string.IsNullOrEmpty(TranscriptBox.Text))
+            Clipboard.SetText(TranscriptBox.Text);
     }
 
-    protected override async void OnClosing(CancelEventArgs e)
+    protected override void OnClosed(EventArgs e)
     {
-        if (allowClose) { base.OnClosing(e); return; }
-        e.Cancel = true;
-        base.OnClosing(e);
-        if (closing) return;
-        closing = true;
-        startupCancellation?.Cancel();
-        if (startupTask != null) await startupTask;
-        if (mic != null || stoppingTask != null) await StopSessionAsync();
-        if (sessionError != null)
+        cts?.Cancel();
+        if (mic is not null)
         {
-            closing = false;
-            StartButton.IsEnabled = true;
-            if (MessageBox.Show(this, "An error occurred. Close anyway? Copy any needed text first.", "Close transcript", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
-                return;
+            mic.DataAvailable -= Mic_DataAvailable;
+            mic.StopRecording();
+            mic.Dispose();
         }
-        allowClose = true;
-        Close();
+        base.OnClosed(e);
+    }
+
+    static byte[] BuildWav(byte[] pcm)
+    {
+        using var memory = new MemoryStream();
+        using (var writer = new BinaryWriter(memory, Encoding.UTF8, true))
+        {
+            writer.Write(Encoding.ASCII.GetBytes("RIFF"));
+            writer.Write(36 + pcm.Length);
+            writer.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
+            writer.Write(16);
+            writer.Write((short)1);
+            writer.Write((short)1);
+            writer.Write(SampleRate);
+            writer.Write(SampleRate * 2);
+            writer.Write((short)2);
+            writer.Write((short)16);
+            writer.Write(Encoding.ASCII.GetBytes("data"));
+            writer.Write(pcm.Length);
+            writer.Write(pcm);
+        }
+        return memory.ToArray();
     }
 }
