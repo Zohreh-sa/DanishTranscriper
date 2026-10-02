@@ -21,7 +21,7 @@ jobs:
           dotnet-version: '9.0.x'
 
       - name: Restore
-        run: dotnet restore DanishTranscriper.sln
+        run: dotnet restore DanishTranscriper.sln -r win-x64
 
       - name: Build
         run: dotnet build DanishTranscriper.sln -c Release --no-restore
