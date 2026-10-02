@@ -14,16 +14,27 @@ public static class TranscriptDocument
         var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            using (var doc = WordprocessingDocument.Create(temporary, DocumentFormat.OpenXml.WordprocessingDocumentType.Document))
+            using (var document = WordprocessingDocument.Create(
+                       temporary,
+                       DocumentFormat.OpenXml.WordprocessingDocumentType.Document))
             {
-                var main = doc.AddMainDocumentPart();
-                main.Document = new Document(new Body(
-                    new Paragraph(new Run(new Text($"Danish transcript — {started:yyyy-MM-dd HH:mm}"))),
-                    new Paragraph(new Run(new Text(text) { Space = DocumentFormat.OpenXml.SpaceProcessingModeValues.Preserve }))));
+                var main = document.AddMainDocumentPart();
+                main.Document = new Document(
+                    new Body(
+                        new Paragraph(new Run(new Text($"Danish transcript — {started:yyyy-MM-dd HH:mm}"))),
+                        new Paragraph(new Run(new Text(text)
+                        {
+                            Space = DocumentFormat.OpenXml.SpaceProcessingModeValues.Preserve
+                        }))));
                 main.Document.Save();
             }
+
             File.Move(temporary, path, true);
         }
-        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        finally
+        {
+            if (File.Exists(temporary))
+                File.Delete(temporary);
+        }
     }
 }

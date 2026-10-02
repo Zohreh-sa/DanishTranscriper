@@ -1,21 +1,25 @@
 namespace DanishTranscriber;
 
-// Only unprocessed 16 kHz, mono, signed 16-bit samples are retained.
+// Keeps only unprocessed 16 kHz, mono, signed 16-bit samples in memory.
 public sealed class PcmBuffer(int capacity = 32000 * 120)
 {
     public const int BytesPerSecond = 32000;
-    private readonly Queue<byte[]> buffers = new();
-    private readonly object gate = new();
-    private int length;
+    readonly Queue<byte[]> buffers = new();
+    readonly object gate = new();
+    int length;
 
     public bool TryAppend(byte[] data, int count)
     {
         if (count < 0 || count > data.Length || count % 2 != 0)
             throw new ArgumentOutOfRangeException(nameof(count));
+
         lock (gate)
         {
-            if (count > capacity - length) return false;
-            if (count > 0) buffers.Enqueue(data.AsSpan(0, count).ToArray());
+            if (count > capacity - length)
+                return false;
+
+            if (count > 0)
+                buffers.Enqueue(data.AsSpan(0, count).ToArray());
             length += count;
             return true;
         }
